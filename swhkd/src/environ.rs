@@ -1,141 +1,77 @@
-use std::{
-    env::VarError,
-    path::{Path, PathBuf},
-};
-
-pub struct Env {
-    pub pkexec_id: u32,
-    pub xdg_config_home: PathBuf,
-    pub xdg_runtime_socket: PathBuf,
-    pub xdg_runtime_dir: PathBuf,
-}
+use std::{collections::HashMap, error::Error, path::PathBuf, process::Command};
 
 #[derive(Debug)]
-pub enum EnvError {
-    PkexecNotFound,
-    XdgConfigNotFound,
-    XdgRuntimeNotFound,
-    PathNotFound,
-    GenericError(String),
+pub struct Env {
+    pub pairs: HashMap<String, String>,
+    pub uname: String,
 }
 
 impl Env {
-    pub fn construct() -> Self {
-        let pkexec_id = match Self::get_env("PKEXEC_UID") {
-            Ok(val) => match val.parse::<u32>() {
-                Ok(val) => val,
-                Err(_) => {
-                    log::error!("Failed to launch swhkd!!!");
-                    log::error!("Make sure to launch the binary with pkexec.");
-                    std::process::exit(1);
-                }
-            },
-            Err(_) => {
-                log::error!("Failed to launch swhkd!!!");
-                log::error!("Make sure to launch the binary with pkexec.");
-                std::process::exit(1);
+    pub fn get_default_shell() -> Result<String, Box<dyn Error>> {
+        // read from /etc/passwd
+        let passwd = std::fs::read_to_string("/etc/passwd")?;
+        let lines: Vec<&str> = passwd.split('\n').collect();
+        for line in lines {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() > 2 {
+                let user_shell = parts[6];
+                return Ok(user_shell.to_string());
             }
-        };
-
-        let xdg_config_home = match Self::get_env("XDG_CONFIG_HOME") {
-            Ok(val) => match validate_path(&PathBuf::from(val)) {
-                Ok(val) => val,
-                Err(e) => match e {
-                    EnvError::PathNotFound => {
-                        log::warn!("XDG_CONFIG_HOME does not exist, using hardcoded /etc");
-                        PathBuf::from("/etc")
-                    }
-                    _ => {
-                        eprintln!("Failed to get XDG_CONFIG_HOME: {:?}", e);
-                        std::process::exit(1);
-                    }
-                },
-            },
-            Err(e) => match e {
-                EnvError::XdgConfigNotFound => {
-                    log::warn!("XDG_CONFIG_HOME not found, using hardcoded /etc");
-                    PathBuf::from("/etc")
-                }
-                _ => {
-                    eprintln!("Failed to get XDG_CONFIG_HOME: {:?}", e);
-                    std::process::exit(1);
-                }
-            },
-        };
-
-        let xdg_runtime_socket = match Self::get_env("XDG_RUNTIME_DIR") {
-            Ok(val) => match validate_path(&PathBuf::from(val).join("swhkd.sock")) {
-                Ok(val) => val,
-                Err(e) => match e {
-                    EnvError::PathNotFound => {
-                        log::warn!("XDG_RUNTIME_DIR does not exist, using hardcoded /run/user");
-                        PathBuf::from(format!("/run/user/{}", pkexec_id))
-                    }
-                    _ => {
-                        eprintln!("Failed to get XDG_RUNTIME_DIR: {:?}", e);
-                        std::process::exit(1);
-                    }
-                },
-            },
-            Err(e) => match e {
-                EnvError::XdgRuntimeNotFound => {
-                    log::warn!("XDG_RUNTIME_DIR not found, using hardcoded /run/user");
-                    PathBuf::from(format!("/run/user/{}", pkexec_id))
-                }
-                _ => {
-                    eprintln!("Failed to get XDG_RUNTIME_DIR: {:?}", e);
-                    std::process::exit(1);
-                }
-            },
-        };
-
-        let xdg_runtime_dir = match Self::get_env("XDG_RUNTIME_DIR") {
-            Ok(val) => PathBuf::from(val),
-            Err(e) => match e {
-                EnvError::XdgRuntimeNotFound => {
-                    log::warn!("XDG_RUNTIME_DIR not found, using hardcoded /run/user");
-                    PathBuf::from(format!("/run/user/{}", pkexec_id))
-                }
-                _ => {
-                    eprintln!("Failed to get XDG_RUNTIME_DIR: {:?}", e);
-                    std::process::exit(1);
-                }
-            },
-        };
-
-        Self { pkexec_id, xdg_config_home, xdg_runtime_dir, xdg_runtime_socket }
+        }
+        Err("User shell not found".into())
     }
 
-    fn get_env(name: &str) -> Result<String, EnvError> {
-        match std::env::var(name) {
-            Ok(val) => Ok(val),
-            Err(e) => match e {
-                VarError::NotPresent => match name {
-                    "PKEXEC_UID" => Err(EnvError::PkexecNotFound),
-                    "XDG_CONFIG_HOME" => Err(EnvError::XdgConfigNotFound),
-                    "XDG_RUNTIME_DIR" => Err(EnvError::XdgRuntimeNotFound),
-                    _ => Err(EnvError::GenericError(e.to_string())),
-                },
-                VarError::NotUnicode(_) => {
-                    Err(EnvError::GenericError("Not a valid unicode".to_string()))
-                }
-            },
+    fn get_env(uname: &str) -> Result<String, Box<dyn Error>> {
+        let shell = Self::get_default_shell()?;
+        let cmd =
+            Command::new("su").arg(uname).arg(shell).arg("-c").arg("-l").arg("env").output()?;
+        let stdout = String::from_utf8(cmd.stdout)?;
+        Ok(stdout)
+    }
+
+    fn parse_env(env: &str) -> HashMap<String, String> {
+        let mut pairs = HashMap::new();
+        for line in env.lines() {
+            let mut parts = line.splitn(2, '=');
+            if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+                pairs.insert(key.to_string(), value.to_string());
+            }
         }
+        pairs
+    }
+
+    pub fn construct(uname: &str, env: Option<&str>) -> Self {
+        let env = match env {
+            Some(env) => env.to_string(),
+            None => Self::get_env(uname).unwrap(),
+        };
+        let pairs = Self::parse_env(&env);
+        Self { pairs, uname: uname.to_string() }
+    }
+
+    pub fn fetch_home(&self) -> Option<PathBuf> {
+        let home = match self.pairs.get("HOME") {
+            Some(it) => it,
+            None => return None,
+        };
+        Some(PathBuf::from(home))
     }
 
     pub fn fetch_xdg_config_path(&self) -> PathBuf {
-        PathBuf::from(&self.xdg_config_home).join("swhkd/swhkdrc")
+        let default = match self.fetch_home() {
+            Some(x) => x.join(".config"),
+            None => PathBuf::from("/etc"),
+        }
+        .to_string_lossy()
+        .to_string();
+        let xdg_config_home = self.pairs.get("XDG_CONFIG_HOME").unwrap_or(&default);
+
+        PathBuf::from(xdg_config_home).join("swhkd").join("swhkdrc")
     }
 
-    pub fn fetch_xdg_runtime_socket_path(&self) -> PathBuf {
-        PathBuf::from(&self.xdg_runtime_dir).join("swhkd.sock")
-    }
-}
-
-fn validate_path(path: &Path) -> Result<PathBuf, EnvError> {
-    if path.exists() {
-        Ok(path.to_path_buf())
-    } else {
-        Err(EnvError::PathNotFound)
+    pub fn xdg_runtime_dir(&self, uid: u32) -> PathBuf {
+        let default = format!("/run/user/{}", uid);
+        let xdg_runtime_dir = self.pairs.get("XDG_RUNTIME_DIR").unwrap_or(&default);
+        PathBuf::from(xdg_runtime_dir)
     }
 }

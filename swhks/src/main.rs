@@ -1,21 +1,9 @@
-use clap::Parser;
-use environ::Env;
-use nix::{
-    sys::stat::{umask, Mode},
-    unistd::daemon,
-};
-use std::io::Read;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
-    env, fs,
-    fs::OpenOptions,
-    os::unix::net::UnixListener,
-    path::{Path, PathBuf},
-    process::{exit, id, Command, Stdio},
+    collections::HashMap, io::Write, os::unix::net::UnixStream, path::PathBuf, process::Command,
 };
-use sysinfo::{ProcessExt, System, SystemExt};
 
-mod environ;
+use clap::Parser;
+use nix::unistd::daemon;
 
 /// IPC Server for swhkd
 #[derive(Parser)]
@@ -30,6 +18,24 @@ struct Args {
     debug: bool,
 }
 
+fn get_env() -> Result<String, Box<dyn std::error::Error>> {
+    let shell = std::env::var("SHELL")?;
+    let cmd = Command::new(shell).arg("-c").arg("env").output()?;
+    let stdout = String::from_utf8(cmd.stdout)?;
+    Ok(stdout)
+}
+
+fn parse_env(env: &str) -> HashMap<String, String> {
+    let mut pairs = HashMap::new();
+    for line in env.lines() {
+        let mut parts = line.splitn(2, '=');
+        if let (Some(key), Some(value)) = (parts.next(), parts.next()) {
+            pairs.insert(key.to_string(), value.to_string());
+        }
+    }
+    pairs
+}
+
 fn main() -> std::io::Result<()> {
     let args = Args::parse();
     if args.debug {
@@ -40,125 +46,39 @@ fn main() -> std::io::Result<()> {
             .init();
     }
 
-    log::trace!("Setting process umask.");
-    umask(Mode::S_IWGRP | Mode::S_IWOTH);
-
-    // This is used to initialize the environment variables only once
-    let environment = environ::Env::construct();
-
-    let (pid_file_path, sock_file_path) = get_file_paths(&environment);
-
-    let log_file_name = if let Some(val) = args.log {
-        val
-    } else {
-        let time = match SystemTime::now().duration_since(UNIX_EPOCH) {
-            Ok(n) => n.as_secs().to_string(),
-            Err(_) => {
-                log::error!("SystemTime before UnixEpoch!");
-                exit(1);
-            }
-        };
-
-        format!("{}/swhks/swhks-{}.log", environment.data_home.to_string_lossy(), time).into()
+    let env_raw = match get_env() {
+        Ok(env) => env,
+        Err(_) => "".to_string(),
     };
 
-    let log_path = Path::new(&log_file_name);
-    if let Some(p) = log_path.parent() {
-        if !p.exists() {
-            if let Err(e) = fs::create_dir_all(p) {
-                log::error!("Failed to create log dir: {}", e);
-            }
-        }
-    }
+    let env = parse_env(&env_raw);
 
-    if Path::new(&pid_file_path).exists() {
-        log::trace!("Reading {} file and checking for running instances.", pid_file_path);
-        let swhks_pid = match fs::read_to_string(&pid_file_path) {
-            Ok(swhks_pid) => swhks_pid,
-            Err(e) => {
-                log::error!("Unable to read {} to check all running instances", e);
-                exit(1);
-            }
-        };
-        log::debug!("Previous PID: {}", swhks_pid);
+    let runtime_dir = env.get("XDG_RUNTIME_DIR").unwrap();
 
-        let mut sys = System::new_all();
-        sys.refresh_all();
-        for (pid, process) in sys.processes() {
-            if pid.to_string() == swhks_pid && process.exe() == env::current_exe().unwrap() {
-                log::error!("Server is already running!");
-                exit(1);
-            }
-        }
-    }
+    let (pid_file_path, sock_file_path) = get_file_paths(runtime_dir);
+    println!("pid_file_path: {}", pid_file_path);
+    println!("sock_file_path: {}", sock_file_path);
 
-    if Path::new(&sock_file_path).exists() {
-        log::trace!("Sockfile exists, attempting to remove it.");
-        match fs::remove_file(&sock_file_path) {
-            Ok(_) => {
-                log::debug!("Removed old socket file");
-            }
-            Err(e) => {
-                log::error!("Error removing the socket file!: {}", e);
-                log::error!("You can manually remove the socket file: {}", sock_file_path);
-                exit(1);
-            }
+    log::info!("Started SWHKS placeholder server");
+    let _ = daemon(true, false);
+    loop{
+        match UnixStream::connect(&sock_file_path){
+            Ok(mut stream) => {
+                let _ = stream.write_all(env_raw.as_bytes());
+                break;
+            },
+            Err(_) => {
+                println!("Waiting...");
+            },
         };
     }
 
-    match fs::write(&pid_file_path, id().to_string()) {
-        Ok(_) => {}
-        Err(e) => {
-            log::error!("Unable to write to {}: {}", pid_file_path, e);
-            exit(1);
-        }
-    }
-
-    let listener = UnixListener::bind(sock_file_path)?;
-    loop {
-        match listener.accept() {
-            Ok((mut socket, address)) => {
-                let mut response = String::new();
-                socket.read_to_string(&mut response)?;
-                run_system_command(&response, log_path);
-                log::debug!("Socket: {:?} Address: {:?} Response: {}", socket, address, response);
-            }
-            Err(e) => log::error!("accept function failed: {:?}", e),
-        }
-    }
+    Ok(())
 }
 
-fn get_file_paths(env: &Env) -> (String, String) {
-    let pid_file_path = format!("{}/swhks.pid", env.runtime_dir.to_string_lossy());
-    let sock_file_path = format!("{}/swhkd.sock", env.runtime_dir.to_string_lossy());
+fn get_file_paths(runtime_dir: &str) -> (String, String) {
+    let pid_file_path = format!("{}/swhks.pid", runtime_dir);
+    let sock_file_path = format!("{}/swhkd.sock", runtime_dir);
 
     (pid_file_path, sock_file_path)
-}
-
-fn run_system_command(command: &str, log_path: &Path) {
-    _ = daemon(true, false);
-
-    if let Err(e) = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdin(Stdio::null())
-        .stdout(match OpenOptions::new().append(true).create(true).open(log_path) {
-            Ok(file) => file,
-            Err(e) => {
-                _ = Command::new("notify-send").arg(format!("ERROR {}", e)).spawn();
-                exit(1);
-            }
-        })
-        .stderr(match OpenOptions::new().append(true).create(true).open(log_path) {
-            Ok(file) => file,
-            Err(e) => {
-                _ = Command::new("notify-send").arg(format!("ERROR {}", e)).spawn();
-                exit(1);
-            }
-        })
-        .spawn()
-    {
-        log::error!("Failed to execute {}", command);
-        log::error!("Error: {}", e);
-    }
 }
